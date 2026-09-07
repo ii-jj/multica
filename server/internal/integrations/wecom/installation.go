@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -61,6 +62,18 @@ type InstallationService struct {
 	// WeCom at install time gets a 503 and retries, it does not get to install
 	// unverified credentials over somebody else's row.
 	probe CredentialProbe
+
+	// logger is only ever used to say what a bot swap threw away. Nil-safe
+	// through log() below, the same shape channel_media_reconciler.go uses, so
+	// a struct built in a test does not have to supply one.
+	logger *slog.Logger
+}
+
+func (s *InstallationService) log() *slog.Logger {
+	if s.logger == nil {
+		return slog.Default()
+	}
+	return s.logger
 }
 
 // InstallationOption configures the service at construction.
@@ -94,10 +107,11 @@ func NewInstallationService(queries *db.Queries, tx engine.TxStarter, box *secre
 		return nil, errors.New("wecom: InstallationService requires a non-nil secretbox.Box")
 	}
 	svc := &InstallationService{
-		store: NewStore(queries),
-		tx:    tx,
-		box:   box,
-		probe: NewHandshakeProbe(nil, ""),
+		store:  NewStore(queries),
+		tx:     tx,
+		box:    box,
+		probe:  NewHandshakeProbe(nil, ""),
+		logger: slog.Default(),
 	}
 	for _, o := range opts {
 		o(svc)
@@ -237,10 +251,32 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 	//
 	// Runs in this transaction, before the upsert, so a swap that fails later
 	// leaves the old bot's rows intact rather than half-cleared. (#6547)
+	//
+	// The sweep is not airtight, and cannot be from here. The slot lock taken
+	// above is the NEW bot's; the OLD bot's socket stays live until the
+	// Supervisor tears it down, so an inbound message arriving under it between
+	// this DELETE and the COMMIT re-inserts a binding that outlives the sweep.
+	// The window is short and self-healing — that binding is the old bot's
+	// namespace, so the next delivery over it fails to address and the user
+	// re-binds — and closing it properly means a second clear once the old
+	// connection is confirmed down, which this transaction cannot observe.
 	if carried.ID.Valid && carried.BotID != "" && carried.BotID != p.BotID {
-		if err := qtx.Queries.ClearChannelInstallationBotScopedRows(ctx, carried.ID); err != nil {
+		cleared, err := qtx.Queries.ClearChannelInstallationBotScopedRows(ctx, carried.ID)
+		if err != nil {
 			return Installation{}, fmt.Errorf("wecom: clear previous bot's rows: %w", err)
 		}
+		// A queued task delivery is a RUNNING task's answer. Dropping it is
+		// right — its address is the old bot's userid, unreachable from the new
+		// connection either way — but processEvent then finds no row and
+		// returns nil, with no counter and no line of its own, so this is the
+		// only place that can say where the answer went.
+		s.log().InfoContext(ctx, "wecom: bot swap cleared the previous bot's rows",
+			"installation_id", uuidStringPub(carried.ID),
+			"previous_bot_id", carried.BotID,
+			"user_bindings", cleared.UserBindings,
+			"chat_session_bindings", cleared.ChatSessionBindings,
+			"queued_task_deliveries_dropped", cleared.TaskDeliveries,
+		)
 	}
 
 	// The chat name is optional in the dialog, so an admin rotating a leaked
