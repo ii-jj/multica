@@ -264,7 +264,7 @@ detached_audit AS (
 )
 SELECT id FROM dead;
 
--- name: ClearChannelInstallationBotScopedRows :exec
+-- name: ClearChannelInstallationBotScopedRows :one
 -- Bot-swap cleanup. Pointing an existing installation at a DIFFERENT bot keeps
 -- the installation row and its id — UpsertChannelInstallation conflicts on
 -- (workspace_id, agent_id, channel_type) and only rewrites config — so every
@@ -290,6 +290,12 @@ SELECT id FROM dead;
 -- them. channel_outbound_card_message has no installation_id and no FK, so it
 -- is reached through the just-removed bindings — the only link back — and goes
 -- because the platform message ids on it belong to the old bot.
+--
+-- Returns what it removed. A queued channel_task_delivery is a RUNNING task's
+-- answer: processEvent finds no row and returns nil, so the answer is dropped
+-- with no counter and no log line of its own. Deleting it is still right — the
+-- address on it is the old bot's userid and unreachable either way — but
+-- whoever is waiting for that answer deserves one line saying where it went.
 WITH cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding AS binding
     WHERE binding.installation_id = @installation_id
@@ -298,25 +304,37 @@ WITH cleared_chat_sessions AS (
 cleared_outbound_cards AS (
     DELETE FROM channel_outbound_card_message AS card
     WHERE card.chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+    RETURNING card.id
 ),
 cleared_task_deliveries AS (
     DELETE FROM channel_task_delivery AS delivery
     WHERE delivery.installation_id = @installation_id
+    RETURNING delivery.task_id
 ),
 cleared_outbound_messages AS (
     DELETE FROM channel_outbound_message AS outbound
     WHERE outbound.installation_id = @installation_id
+    RETURNING outbound.channel_message_id
 ),
 cleared_binding_tokens AS (
     DELETE FROM channel_binding_token AS token
     WHERE token.installation_id = @installation_id
+    RETURNING token.token_hash
 ),
 cleared_inbound_dedup AS (
     DELETE FROM channel_inbound_message_dedup AS dedup
     WHERE dedup.installation_id = @installation_id
+    RETURNING dedup.message_id
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding AS user_binding
+    WHERE user_binding.installation_id = @installation_id
+    RETURNING user_binding.id
 )
-DELETE FROM channel_user_binding AS user_binding
-WHERE user_binding.installation_id = @installation_id;
+SELECT
+    (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
+    (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries;
 
 -- name: DeleteChannelInstallationsBySystemRuntimeAgents :exec
 -- Application-layer replacement for the (deliberately absent, MUL-3515 §4)

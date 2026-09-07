@@ -25,6 +25,8 @@ const (
 	wcSwapAgent   = "5c09e202-0000-4000-8000-00000000000a"
 	wcSwapUser    = "5c09e202-0000-4000-8000-000000000005"
 	wcSwapChat    = "5c09e202-0000-4000-8000-000000000007"
+	wcSwapBinding = "5c09e202-0000-4000-8000-00000000000b"
+	wcSwapTask    = "5c09e202-0000-4000-8000-00000000000c"
 
 	wcSwapBotA = "bot_swap_a"
 	wcSwapBotB = "bot_swap_b"
@@ -49,6 +51,9 @@ func setupBotSwap(t *testing.T) (context.Context, *pgxpool.Pool, *InstallationSe
 		_, _ = pool.Exec(ctx, `DELETE FROM channel_user_binding WHERE workspace_id = $1`, wcSwapWS)
 		_, _ = pool.Exec(ctx, `DELETE FROM channel_binding_token WHERE workspace_id = $1`, wcSwapWS)
 		_, _ = pool.Exec(ctx, `DELETE FROM channel_inbound_message_dedup WHERE message_id = $1`, "msg_under_bot_a")
+		_, _ = pool.Exec(ctx, `DELETE FROM channel_task_delivery WHERE task_id = $1`, wcSwapTask)
+		_, _ = pool.Exec(ctx, `DELETE FROM channel_outbound_message WHERE binding_id = $1`, wcSwapBinding)
+		_, _ = pool.Exec(ctx, `DELETE FROM channel_outbound_card_message WHERE chat_session_id = $1`, wcSwapChat)
 		_, _ = pool.Exec(ctx, `DELETE FROM channel_installation WHERE config->>'app_id' = ANY($1)`,
 			[]string{wcSwapBotA, wcSwapBotB})
 		_, _ = pool.Exec(ctx, `DELETE FROM workspace WHERE id = $1`, wcSwapWS)
@@ -97,6 +102,18 @@ VALUES ($1, $2, 'wecom', $3, 'p2p', '{}'::jsonb)`, wcSwapChat, installationID, w
 VALUES ($1, $2, $3, 'wecom', $4, now() + interval '10 minutes')`, "hash_"+wcSwapUserIDUnderA, wcSwapWS, installationID, wcSwapUserIDUnderA)
 	exec(`INSERT INTO channel_inbound_message_dedup (installation_id, message_id)
 VALUES ($1, $2)`, installationID, "msg_under_bot_a")
+	// The outbound three. They are the same defect one step later: each carries
+	// the old bot's userid as the address it would be sent to, over the new
+	// bot's connection. channel_outbound_card_message has no installation_id
+	// and no FK, so it hangs off the chat-session binding above — the only link
+	// back, and the reason the query reaches it through that binding rather
+	// than directly.
+	exec(`INSERT INTO channel_task_delivery (task_id, binding_id, installation_id, channel_type, channel_chat_id, chat_type, route_revision, config)
+VALUES ($1, $2, $3, 'wecom', $4, 'p2p', 1, '{}'::jsonb)`, wcSwapTask, wcSwapBinding, installationID, wcSwapUserIDUnderA)
+	exec(`INSERT INTO channel_outbound_message (installation_id, channel_type, channel_message_id, binding_id, route_revision, outbound_kind)
+VALUES ($1, 'wecom', $2, $3, 1, 'reply')`, installationID, "sent_under_bot_a", wcSwapBinding)
+	exec(`INSERT INTO channel_outbound_card_message (chat_session_id, channel_type, channel_chat_id, channel_card_message_id)
+VALUES ($1, 'wecom', $2, $3)`, wcSwapChat, wcSwapUserIDUnderA, "card_under_bot_a")
 }
 
 // countBotScopedRows totals the rows still hanging off an installation.
@@ -108,6 +125,8 @@ func countBotScopedRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, i
 		"channel_chat_session_binding",
 		"channel_binding_token",
 		"channel_inbound_message_dedup",
+		"channel_task_delivery",
+		"channel_outbound_message",
 	} {
 		var n int
 		// The table name is a constant from the list above, never input.
@@ -118,6 +137,15 @@ func countBotScopedRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, i
 		}
 		counts[table] = n
 	}
+	// Counted by chat session, not installation: this is the one table with
+	// neither column nor FK, which is why it is reached through the binding.
+	var cards int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM channel_outbound_card_message WHERE chat_session_id = $1`, wcSwapChat,
+	).Scan(&cards); err != nil {
+		t.Fatalf("count channel_outbound_card_message: %v", err)
+	}
+	counts["channel_outbound_card_message"] = cards
 	return counts
 }
 

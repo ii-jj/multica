@@ -358,7 +358,7 @@ func (q *Queries) ClearChannelChatSessionPendingFreshForRevision(ctx context.Con
 	return err
 }
 
-const clearChannelInstallationBotScopedRows = `-- name: ClearChannelInstallationBotScopedRows :exec
+const clearChannelInstallationBotScopedRows = `-- name: ClearChannelInstallationBotScopedRows :one
 WITH cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding AS binding
     WHERE binding.installation_id = $1
@@ -367,26 +367,44 @@ WITH cleared_chat_sessions AS (
 cleared_outbound_cards AS (
     DELETE FROM channel_outbound_card_message AS card
     WHERE card.chat_session_id IN (SELECT chat_session_id FROM cleared_chat_sessions)
+    RETURNING card.id
 ),
 cleared_task_deliveries AS (
     DELETE FROM channel_task_delivery AS delivery
     WHERE delivery.installation_id = $1
+    RETURNING delivery.task_id
 ),
 cleared_outbound_messages AS (
     DELETE FROM channel_outbound_message AS outbound
     WHERE outbound.installation_id = $1
+    RETURNING outbound.channel_message_id
 ),
 cleared_binding_tokens AS (
     DELETE FROM channel_binding_token AS token
     WHERE token.installation_id = $1
+    RETURNING token.token_hash
 ),
 cleared_inbound_dedup AS (
     DELETE FROM channel_inbound_message_dedup AS dedup
     WHERE dedup.installation_id = $1
+    RETURNING dedup.message_id
+),
+cleared_user_bindings AS (
+    DELETE FROM channel_user_binding AS user_binding
+    WHERE user_binding.installation_id = $1
+    RETURNING user_binding.id
 )
-DELETE FROM channel_user_binding AS user_binding
-WHERE user_binding.installation_id = $1
+SELECT
+    (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
+    (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries
 `
+
+type ClearChannelInstallationBotScopedRowsRow struct {
+	UserBindings        int64 `json:"user_bindings"`
+	ChatSessionBindings int64 `json:"chat_session_bindings"`
+	TaskDeliveries      int64 `json:"task_deliveries"`
+}
 
 // Bot-swap cleanup. Pointing an existing installation at a DIFFERENT bot keeps
 // the installation row and its id — UpsertChannelInstallation conflicts on
@@ -413,9 +431,17 @@ WHERE user_binding.installation_id = $1
 // them. channel_outbound_card_message has no installation_id and no FK, so it
 // is reached through the just-removed bindings — the only link back — and goes
 // because the platform message ids on it belong to the old bot.
-func (q *Queries) ClearChannelInstallationBotScopedRows(ctx context.Context, installationID pgtype.UUID) error {
-	_, err := q.db.Exec(ctx, clearChannelInstallationBotScopedRows, installationID)
-	return err
+//
+// Returns what it removed. A queued channel_task_delivery is a RUNNING task's
+// answer: processEvent finds no row and returns nil, so the answer is dropped
+// with no counter and no log line of its own. Deleting it is still right — the
+// address on it is the old bot's userid and unreachable either way — but
+// whoever is waiting for that answer deserves one line saying where it went.
+func (q *Queries) ClearChannelInstallationBotScopedRows(ctx context.Context, installationID pgtype.UUID) (ClearChannelInstallationBotScopedRowsRow, error) {
+	row := q.db.QueryRow(ctx, clearChannelInstallationBotScopedRows, installationID)
+	var i ClearChannelInstallationBotScopedRowsRow
+	err := row.Scan(&i.UserBindings, &i.ChatSessionBindings, &i.TaskDeliveries)
+	return i, err
 }
 
 const consumeChannelBindingToken = `-- name: ConsumeChannelBindingToken :one
