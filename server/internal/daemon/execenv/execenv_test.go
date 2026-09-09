@@ -1415,7 +1415,7 @@ func TestInjectRuntimeConfigAvailableCommandsCoreOnly(t *testing.T) {
 		"## Available Commands",
 		"core agent loop and common issue create/update tasks",
 		"`multica <command> --help`",
-		"multica issue get <id> --output json",
+		"multica issue get <id> [--compact] --output json",
 		"multica issue comment list <issue-id>",
 		"multica issue create --title",
 		"multica issue update <id>",

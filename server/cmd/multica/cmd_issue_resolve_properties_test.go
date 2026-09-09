@@ -437,6 +437,7 @@ func newIssueGetTestCmd(output string, resolve bool) *cobra.Command {
 	cmd := &cobra.Command{Use: "get"}
 	cmd.Flags().String("output", output, "")
 	cmd.Flags().Bool("resolve-properties", resolve, "")
+	cmd.Flags().Bool("compact", false, "")
 	return cmd
 }
 

@@ -521,6 +521,7 @@ func init() {
 
 	// issue get
 	issueGetCmd.Flags().String("output", "json", "Output format: table or json")
+	issueGetCmd.Flags().Bool("compact", false, "JSON output only: drop response fields that carry no information for a reader — the workspace_id and number echoed alongside the identifier, board bookkeeping (position, revision), updated_at when identical to created_at, null-valued fields, and empty arrays. Attachment records keep id/filename/markdown_url and lose the short-lived presigned URLs the CLI is the supported way to fetch. Content, metadata and identity fields pass through untouched. Recommended for agent reads.")
 	issueGetCmd.Flags().Bool("resolve-properties", false, resolvePropertiesHelp)
 
 	// issue pull-requests
@@ -989,6 +990,12 @@ func runIssueGet(cmd *cobra.Command, args []string) error {
 		if err := resolveIssueProperties(ctx, client, nil, &memberDirectory{}, []any{issue}); err != nil {
 			return err
 		}
+	}
+	// Compact runs LAST so --resolve-properties keeps working: it rewrites
+	// `properties` in place, and pruning empty values before that would hide
+	// the key it needs to resolve.
+	if compact, _ := cmd.Flags().GetBool("compact"); compact {
+		compactIssue(issue)
 	}
 	return cli.PrintJSON(os.Stdout, issue)
 }
@@ -3102,18 +3109,104 @@ func compactComments(comments []map[string]any) {
 	for _, c := range comments {
 		delete(c, "issue_id")
 		delete(c, "source_task_id")
-		if ua, ok := c["updated_at"]; ok && ua == c["created_at"] {
-			delete(c, "updated_at")
-		}
-		for k, v := range c {
-			switch vv := v.(type) {
-			case nil:
-				delete(c, k)
-			case []any:
-				if len(vv) == 0 {
-					delete(c, k)
-				}
+		compactRedundantUpdatedAt(c)
+		compactAttachments(c)
+		compactEmptyValues(c)
+	}
+}
+
+// compactIssue is compactComments' counterpart for a single issue record,
+// opted into by `multica issue get --compact`.
+//
+// `issue get` is step 1 of every issue turn the runtime brief prescribes, so
+// its response is on the critical path of every run — and unlike the comment
+// reads it had no way to shed the bookkeeping half of its payload. The fields
+// dropped here are the ones a reader cannot act on:
+//
+//   - workspace_id / number: the caller already addressed this issue, and
+//     `identifier` is the human-facing handle everywhere else in the CLI.
+//   - position / revision: board ordering and optimistic-concurrency state,
+//     owned by the API and never quoted back by an agent.
+//   - status_category when it only repeats status: it is the built-in's own
+//     key for all seven built-ins, and only carries information for a custom
+//     status, which is exactly when it differs.
+//
+// `metadata` and `properties` are deliberately NOT pruned when empty: the
+// brief tells agents an empty `{}` is a normal, meaningful answer, so removing
+// the key would turn "no metadata" into "this response did not say".
+func compactIssue(issue map[string]any) {
+	delete(issue, "workspace_id")
+	delete(issue, "number")
+	delete(issue, "position")
+	delete(issue, "revision")
+	if sc, ok := issue["status_category"]; ok && sc == issue["status"] {
+		delete(issue, "status_category")
+	}
+	compactRedundantUpdatedAt(issue)
+	compactAttachments(issue)
+	compactEmptyValues(issue)
+}
+
+// compactRedundantUpdatedAt drops updated_at when it only restates created_at,
+// i.e. the record was never edited.
+func compactRedundantUpdatedAt(m map[string]any) {
+	if ua, ok := m["updated_at"]; ok && ua == m["created_at"] {
+		delete(m, "updated_at")
+	}
+}
+
+// compactEmptyValues drops null-valued keys and empty arrays.
+//
+// Zero values are NOT empty values: `reply_count: 0` and
+// `content_truncated: false` are answers, and pruning them would turn a
+// negative answer into a missing one (#6546 review).
+func compactEmptyValues(m map[string]any) {
+	for k, v := range m {
+		switch vv := v.(type) {
+		case nil:
+			delete(m, k)
+		case []any:
+			if len(vv) == 0 {
+				delete(m, k)
 			}
 		}
+	}
+}
+
+// compactAttachments slims the attachment records carried by an issue or
+// comment response.
+//
+// Attachments are a per-record array, so their bookkeeping is paid once per
+// attachment rather than once per response — on an issue with a screenshot
+// thread they are the largest non-content field in the payload (#5999
+// measured them at parity with the issue description itself).
+//
+// Of the three URLs on every record, only `markdown_url` survives: it is the
+// one the API contracts as durable and persistable, and it is what an agent
+// embeds when it references a file in a comment. `url` and `download_url` are
+// render-time values for a browser — and the runtime brief already tells
+// agents to fetch attachments through `multica attachment`, never by opening a
+// Multica resource URL, so for the caller this flag is aimed at they are
+// bytes that exist only to be ignored.
+func compactAttachments(m map[string]any) {
+	list, ok := m["attachments"].([]any)
+	if !ok {
+		return
+	}
+	for _, entry := range list {
+		att, ok := entry.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Parent ids the caller already holds: it asked for this issue or is
+		// reading this comment.
+		delete(att, "workspace_id")
+		delete(att, "issue_id")
+		delete(att, "comment_id")
+		delete(att, "url")
+		delete(att, "download_url")
+		delete(att, "attachment_download_url")
+		compactRedundantUpdatedAt(att)
+		compactEmptyValues(att)
 	}
 }

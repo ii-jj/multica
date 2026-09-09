@@ -68,11 +68,17 @@ func TestBuildMetaSkillContentBriefContent(t *testing.T) {
 		AgentID:          "eve-1",
 	})
 
-	if !strings.Contains(out, "- `multica issue get <id> --output json` — full issue.\n") {
+	if !strings.Contains(out, "- `multica issue get <id> [--compact] --output json` — full issue.") {
 		t.Errorf("brief is missing the `issue get` one-liner\n---\n%s", out)
 	}
 	if strings.Contains(out, "Get full issue details.") {
 		t.Errorf("brief still carries the retired legacy `issue get` description\n---\n%s", out)
+	}
+	// The flag only pays off if the agent knows it exists: `issue get` is step
+	// 1 of every issue turn, and nothing else in the run tells it about
+	// --compact.
+	if !strings.Contains(out, "`--compact` drops board bookkeeping") {
+		t.Errorf("brief does not advertise `issue get --compact`\n---\n%s", out)
 	}
 }
 
