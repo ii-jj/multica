@@ -403,13 +403,15 @@ cleared_user_bindings AS (
 SELECT
     (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
     (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
-    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries,
+    (SELECT count(*) FROM cleared_outbound_messages)::bigint AS outbound_messages
 `
 
 type ClearChannelInstallationBotScopedRowsRow struct {
 	UserBindings        int64 `json:"user_bindings"`
 	ChatSessionBindings int64 `json:"chat_session_bindings"`
 	TaskDeliveries      int64 `json:"task_deliveries"`
+	OutboundMessages    int64 `json:"outbound_messages"`
 }
 
 // Bot-swap cleanup. Pointing an existing installation at a DIFFERENT bot keeps
@@ -443,10 +445,18 @@ type ClearChannelInstallationBotScopedRowsRow struct {
 // with no counter and no log line of its own. Deleting it is still right — the
 // address on it is the old bot's userid and unreachable either way — but
 // whoever is waiting for that answer deserves one line saying where it went.
+// channel_outbound_message is counted for the same reason and not because it is
+// expected to be non-zero: a dropped queued send is a reply that never arrives,
+// and a count nobody has to read costs nothing next to guessing later.
 func (q *Queries) ClearChannelInstallationBotScopedRows(ctx context.Context, installationID pgtype.UUID) (ClearChannelInstallationBotScopedRowsRow, error) {
 	row := q.db.QueryRow(ctx, clearChannelInstallationBotScopedRows, installationID)
 	var i ClearChannelInstallationBotScopedRowsRow
-	err := row.Scan(&i.UserBindings, &i.ChatSessionBindings, &i.TaskDeliveries)
+	err := row.Scan(
+		&i.UserBindings,
+		&i.ChatSessionBindings,
+		&i.TaskDeliveries,
+		&i.OutboundMessages,
+	)
 	return i, err
 }
 

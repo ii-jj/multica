@@ -296,6 +296,9 @@ SELECT id FROM dead;
 -- with no counter and no log line of its own. Deleting it is still right — the
 -- address on it is the old bot's userid and unreachable either way — but
 -- whoever is waiting for that answer deserves one line saying where it went.
+-- channel_outbound_message is counted for the same reason and not because it is
+-- expected to be non-zero: a dropped queued send is a reply that never arrives,
+-- and a count nobody has to read costs nothing next to guessing later.
 WITH cleared_chat_sessions AS (
     DELETE FROM channel_chat_session_binding AS binding
     WHERE binding.installation_id = @installation_id
@@ -334,7 +337,8 @@ cleared_user_bindings AS (
 SELECT
     (SELECT count(*) FROM cleared_user_bindings)::bigint AS user_bindings,
     (SELECT count(*) FROM cleared_chat_sessions)::bigint AS chat_session_bindings,
-    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries;
+    (SELECT count(*) FROM cleared_task_deliveries)::bigint AS task_deliveries,
+    (SELECT count(*) FROM cleared_outbound_messages)::bigint AS outbound_messages;
 
 -- name: DeleteChannelInstallationsBySystemRuntimeAgents :exec
 -- Application-layer replacement for the (deliberately absent, MUL-3515 §4)

@@ -256,10 +256,12 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 	// above is the NEW bot's; the OLD bot's socket stays live until the
 	// Supervisor tears it down, so an inbound message arriving under it between
 	// this DELETE and the COMMIT re-inserts a binding that outlives the sweep.
-	// The window is short and self-healing — that binding is the old bot's
-	// namespace, so the next delivery over it fails to address and the user
-	// re-binds — and closing it properly means a second clear once the old
-	// connection is confirmed down, which this transaction cannot observe.
+	// The window is short and self-healing, but not silently: that binding is
+	// the old bot's namespace, so what the user sees while it heals is one
+	// message that gets no answer and no line saying why, until they re-bind.
+	// Closing it properly means a second clear once the old connection is
+	// confirmed down, which this transaction cannot observe — a Supervisor
+	// signal for "old connection torn down" is the hook to hang it on.
 	if carried.ID.Valid && carried.BotID != "" && carried.BotID != p.BotID {
 		cleared, err := qtx.Queries.ClearChannelInstallationBotScopedRows(ctx, carried.ID)
 		if err != nil {
@@ -269,13 +271,16 @@ func (s *InstallationService) Upsert(ctx context.Context, p InstallationParams) 
 		// right — its address is the old bot's userid, unreachable from the new
 		// connection either way — but processEvent then finds no row and
 		// returns nil, with no counter and no line of its own, so this is the
-		// only place that can say where the answer went.
+		// only place that can say where the answer went. A queued outbound
+		// message is the same story one table over, usually zero for WeCom, and
+		// counted here rather than reasoned about the day it is not.
 		s.log().InfoContext(ctx, "wecom: bot swap cleared the previous bot's rows",
 			"installation_id", uuidStringPub(carried.ID),
 			"previous_bot_id", carried.BotID,
 			"user_bindings", cleared.UserBindings,
 			"chat_session_bindings", cleared.ChatSessionBindings,
 			"queued_task_deliveries_dropped", cleared.TaskDeliveries,
+			"queued_outbound_messages_dropped", cleared.OutboundMessages,
 		)
 	}
 

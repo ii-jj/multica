@@ -13,6 +13,8 @@ package wecom
 
 import (
 	"context"
+	"log/slog"
+	"sync"
 	"testing"
 
 	"github.com/jackc/pgx/v5/pgtype"
@@ -154,6 +156,8 @@ func countBotScopedRows(t *testing.T, ctx context.Context, pool *pgxpool.Pool, i
 // bot whose userid namespace does not contain them.
 func TestSwappingTheBotClearsThePreviousBotsRows(t *testing.T) {
 	ctx, pool, svc := setupBotSwap(t)
+	swept := &sweptCounts{}
+	svc.logger = slog.New(swept)
 
 	under, err := svc.Upsert(ctx, botSwapParams(wcSwapBotA))
 	if err != nil {
@@ -178,6 +182,59 @@ func TestSwappingTheBotClearsThePreviousBotsRows(t *testing.T) {
 				"address userids from a namespace it does not share", table, n)
 		}
 	}
+
+	// The counts are the only trace a dropped reply leaves. A queued task
+	// delivery and a queued outbound message both vanish without a line of
+	// their own — processEvent finds no row and returns nil — so a zero here
+	// while a row was actually deleted is a person waiting for an answer that
+	// no log can account for.
+	line, ok := swept.line()
+	if !ok {
+		t.Fatal("no bot-swap log line; a swap that clears rows must say what it cleared")
+	}
+	for _, field := range []string{
+		"user_bindings", "chat_session_bindings",
+		"queued_task_deliveries_dropped", "queued_outbound_messages_dropped",
+	} {
+		if line[field] != 1 {
+			t.Errorf("%s = %d, want the 1 seeded row reported", field, line[field])
+		}
+	}
+}
+
+// sweptCounts captures the bot-swap log line. The counts go nowhere else: the
+// service returns an Installation, not a report.
+type sweptCounts struct {
+	mu     sync.Mutex
+	counts map[string]int64
+	seen   bool
+}
+
+func (c *sweptCounts) Enabled(context.Context, slog.Level) bool { return true }
+func (c *sweptCounts) WithAttrs([]slog.Attr) slog.Handler       { return c }
+func (c *sweptCounts) WithGroup(string) slog.Handler            { return c }
+
+func (c *sweptCounts) Handle(_ context.Context, r slog.Record) error {
+	if r.Message != "wecom: bot swap cleared the previous bot's rows" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.counts = map[string]int64{}
+	c.seen = true
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Value.Kind() == slog.KindInt64 {
+			c.counts[a.Key] = a.Value.Int64()
+		}
+		return true
+	})
+	return nil
+}
+
+func (c *sweptCounts) line() (map[string]int64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.counts, c.seen
 }
 
 // TestRotatingTheSecretKeepsTheBindings is the other half, and the one a
