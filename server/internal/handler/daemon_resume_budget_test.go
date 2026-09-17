@@ -2,8 +2,10 @@ package handler
 
 import (
 	"context"
+	"net/http"
 	"testing"
 
+	"github.com/multica-ai/multica/server/internal/testutil"
 	db "github.com/multica-ai/multica/server/pkg/db/generated"
 )
 
@@ -156,5 +158,85 @@ func TestResumeExceedsContextBudgetReadsWholeSession(t *testing.T) {
 	// A different session on the same issue is a different budget.
 	if h.resumeExceedsContextBudget(ctx, task, "sess-unrelated") {
 		t.Fatal("the budget must be scoped to the session being resumed")
+	}
+}
+
+// TestClaimTaskByRuntime_OverBudgetResumeReportsNoDeltas pins the rule the
+// deltas already had (MUL-7344) against the new way of not resuming.
+//
+// resumeAnchor dates "what changed since the run you are continuing". Past the
+// budget this turn continues nothing — the transcript is dropped on purpose —
+// so there is no run to date from. Reporting a delta here would be worse than
+// reporting none: NewCommentsDeltaKnown is what lets the workflow SKIP the
+// comment scan, and the agent it would be skipped for has never read those
+// comments.
+//
+// The claim still resumes nothing while keeping the workdir, so the only
+// difference a person sees is the agent re-reading the issue.
+func TestClaimTaskByRuntime_OverBudgetResumeReportsNoDeltas(t *testing.T) {
+	if testHandler == nil || testPool == nil {
+		t.Skip("database not available")
+	}
+	ctx := context.Background()
+	runtimeID := createClaimReclaimRuntime(t, ctx, "over-budget resume runtime")
+	const name = "over-budget resume agent"
+	agentID, issueID := createClaimReclaimAgentAndIssue(t, ctx, runtimeID, name)
+
+	// A prior run that WOULD be adopted: same runtime, resumable session, a
+	// snapshot to compare against. Only its spend disqualifies it.
+	priorID := dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":     runtimeID,
+		"issue_id":       issueID,
+		"status":         "completed",
+		"session_id":     "over-budget-session",
+		"started_at":     testutil.Raw("now() - interval '1 hour'"),
+		"completed_at":   testutil.Raw("now() - interval '50 minutes'"),
+		"issue_snapshot": issueSnapshotJSON(t, issueSnapshotVersion, name+" issue", ""),
+	})
+	// 9M billed against the 8M default: over budget without the test having to
+	// reach into the handler's configuration.
+	dbfx.Exec(t, `
+		INSERT INTO task_usage (task_id, provider, model, input_tokens, cache_read_tokens)
+		VALUES ($1, 'anthropic', 'claude-test', $2, $3)
+	`, priorID, 4_000_000, 5_000_000)
+
+	dbfx.Comment(t, issueID, "an unseen comment")
+	triggerID := dbfx.Comment(t, issueID, "continue")
+	dbfx.Task(t, agentID, testutil.Cols{
+		"runtime_id":         runtimeID,
+		"issue_id":           issueID,
+		"trigger_comment_id": triggerID,
+	})
+
+	req := newDaemonTokenRequest("POST", "/api/daemon/runtimes/"+runtimeID+"/tasks/claim", nil, testWorkspaceID, "over-budget-resume")
+	req = withURLParam(req, "runtimeId", runtimeID)
+	var resp struct {
+		Task *struct {
+			PriorSessionID                string `json:"prior_session_id"`
+			PriorSessionResumeUnavailable bool   `json:"prior_session_resume_unavailable"`
+			PriorWorkDir                  string `json:"prior_work_dir"`
+			NewCommentCount               int    `json:"new_comment_count"`
+			NewCommentsSince              string `json:"new_comments_since"`
+			DeltaKnown                    bool   `json:"new_comments_delta_known"`
+			IssueStateDeltaKnown          bool   `json:"issue_state_delta_known"`
+		} `json:"task"`
+	}
+	testutil.Call(t, testHandler.ClaimTaskByRuntime, req).Want(http.StatusOK).JSON(&resp)
+	if resp.Task == nil {
+		t.Fatal("expected a claimed task")
+	}
+
+	if resp.Task.PriorSessionID != "" {
+		t.Errorf("prior_session_id = %q; the session is past its budget and must not be resumed", resp.Task.PriorSessionID)
+	}
+	if !resp.Task.PriorSessionResumeUnavailable {
+		t.Error("prior_session_resume_unavailable = false; the run has to disclose that its context was dropped")
+	}
+	if resp.Task.IssueStateDeltaKnown || resp.Task.DeltaKnown {
+		t.Errorf("deltas claimed against a run this turn does not continue: %+v", resp.Task)
+	}
+	if resp.Task.NewCommentCount != 0 || resp.Task.NewCommentsSince != "" {
+		t.Errorf("comment anchor survived the dropped session: count=%d since=%q",
+			resp.Task.NewCommentCount, resp.Task.NewCommentsSince)
 	}
 }
